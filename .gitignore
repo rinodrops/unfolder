@@ -1,0 +1,4 @@
+dist/
+.vscode/
+.nova/
+.DS_Store
