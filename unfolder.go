@@ -17,6 +17,9 @@ const (
 	EndMarker = "--END--"
 )
 
+// Global warning counter
+var warningCount int
+
 var header = fmt.Sprintf(`This text describes a repository with code. It consists of sections starting with %s, followed by a line with the file path and name, then varying lines of file contents. The repository text concludes when %s is reached. Any text after %s is to be understood as instructions related to the provided repository.`, SectionDivider, EndMarker, EndMarker)
 
 // Config holds the program configuration
@@ -63,8 +66,9 @@ func exitWithError(format string, args ...interface{}) {
 	os.Exit(1)
 }
 
-// exitWithWarning prints a warning message but doesn't exit
-func exitWithWarning(format string, args ...interface{}) {
+// printWarning prints a warning message and increments the warning counter
+func printWarning(format string, args ...interface{}) {
+	warningCount++
 	fmt.Fprintf(os.Stderr, "Warning: "+format+"\n", args...)
 }
 
@@ -95,10 +99,15 @@ func main() {
 
 	// Write --END-- marker
 	if err := writeEnd(config.OutputPath); err != nil {
-		exitWithWarning("Could not write end marker: %v", err)
+		printWarning("Could not write end marker: %v", err)
 	}
 
 	fmt.Printf("Repository contents written to %s\n", config.OutputPath)
+
+	// Show warning summary if any warnings occurred
+	if warningCount > 0 {
+		fmt.Fprintf(os.Stderr, "\nNote: %d warning(s) occurred during processing. Some files may have been skipped due to permission issues.\n", warningCount)
+	}
 }
 
 func showHelp() {
@@ -188,9 +197,30 @@ func createOutputFile(outputPath string) (*os.File, error) {
 func walkAndProcessFiles(absDir, absOutput string, ignorePatterns []string, output *os.File) error {
 	return filepath.WalkDir(absDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// Handle permission errors for directories
+			if os.IsPermission(err) {
+				printWarning("Permission denied accessing %s: %v", path, err)
+				return filepath.SkipDir // Skip this directory and its contents
+			}
 			return err
 		}
 
+		// Get relative path for ignore checking
+		relPath, err := filepath.Rel(absDir, path)
+		if err != nil {
+			printWarning("Could not get relative path for %s: %v", path, err)
+			return nil
+		}
+
+		// Check if directory should be ignored (before entering it)
+		if d.IsDir() {
+			if shouldIgnore(relPath, ignorePatterns) {
+				return filepath.SkipDir // Skip this directory and its contents
+			}
+			return nil // Continue into this directory
+		}
+
+		// For files, process normally
 		return processDirectoryEntry(path, d, absDir, absOutput, ignorePatterns, output)
 	})
 }
@@ -207,15 +237,12 @@ func processDirectoryEntry(path string, d fs.DirEntry, absDir, absOutput string,
 		return nil
 	}
 
-	// Skip directories
-	if d.IsDir() {
-		return nil
-	}
-
 	// Get relative path
 	relPath, err := filepath.Rel(absDir, path)
 	if err != nil {
-		return err
+		// This is unusual, but continue processing
+		printWarning("Could not get relative path for %s: %v", path, err)
+		return nil
 	}
 
 	// Check if file should be ignored
@@ -253,6 +280,11 @@ func loadIgnorePatterns(directory string) ([]string, error) {
 func readIgnoreFile(path string) ([]string, error) {
 	file, err := os.Open(path)
 	if err != nil {
+		// Check if it's a permission error
+		if os.IsPermission(err) {
+			printWarning("Permission denied reading %s: %v", path, err)
+			return nil, nil // Return empty patterns, continue processing
+		}
 		return nil, err
 	}
 	defer file.Close()
@@ -472,6 +504,11 @@ func matchCharacterClass(c byte, charClass string) bool {
 func isBinary(path string) bool {
 	file, err := os.Open(path)
 	if err != nil {
+		// Check if it's a permission error
+		if os.IsPermission(err) {
+			printWarning("Permission denied reading %s: %v", path, err)
+			return true // Assume binary if can't read due to permissions
+		}
 		return true // Assume binary if can't read
 	}
 	defer file.Close()
@@ -496,6 +533,11 @@ func isBinary(path string) bool {
 func processFile(path, relPath string, output *os.File) error {
 	content, err := os.ReadFile(path)
 	if err != nil {
+		// Check if it's a permission error
+		if os.IsPermission(err) {
+			printWarning("Permission denied reading %s: %v", path, err)
+			return nil // Skip this file, continue processing
+		}
 		return err
 	}
 
@@ -519,6 +561,11 @@ func processFile(path, relPath string, output *os.File) error {
 func writeEnd(outputPath string) error {
 	file, err := os.OpenFile(outputPath, os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
+		// Check if it's a permission error
+		if os.IsPermission(err) {
+			printWarning("Permission denied writing to %s: %v", outputPath, err)
+			return err // This is a critical error, return it
+		}
 		return err
 	}
 	defer file.Close()
