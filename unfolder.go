@@ -20,6 +20,13 @@ const (
 // Global warning counter
 var warningCount int
 
+// Version information (set by build process)
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 var header = fmt.Sprintf(`This text describes a repository with code. It consists of sections starting with %s, followed by a line with the file path and name, then varying lines of file contents. The repository text concludes when %s is reached. Any text after %s is to be understood as instructions related to the provided repository.`, SectionDivider, EndMarker, EndMarker)
 
 // Config holds the program configuration
@@ -81,6 +88,12 @@ func main() {
 		return
 	}
 
+	// Handle version flag
+	if 0 < len(args) && (args[0] == "--version" || args[0] == "-v") {
+		showVersion()
+		return
+	}
+
 	// Parse arguments
 	config, err := parseConfig(args)
 	if err != nil {
@@ -110,6 +123,10 @@ func main() {
 	}
 }
 
+func showVersion() {
+	fmt.Printf("unfolder version %s (%s) %s\n", version, commit, date)
+}
+
 func showHelp() {
 	fmt.Printf(`unfolder - Convert repository contents to text format for AI analysis
 
@@ -126,7 +143,8 @@ Examples:
     unfolder /path/to/repo custom.txt  # Process repo → ./custom.txt
 
 Options:
-    --help, -h   Show this help message
+    --help, -h      Show this help message
+    --version, -v   Show version information
 `)
 }
 
