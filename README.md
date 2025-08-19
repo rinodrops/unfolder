@@ -17,7 +17,7 @@ Download the latest release for your platform from the releases page.
 Requires Go 1.16 or later. Developed and tested with Go 1.25 on macOS 26.
 
 ```bash
-git clone https://github.com/yourusername/unfolder.git
+git clone https://github.com/rinodrops/unfolder.git
 cd unfolder
 make build
 ```
