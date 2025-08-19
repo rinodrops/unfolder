@@ -2,20 +2,33 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/urfave/cli/v3"
 )
 
 const (
 	// SectionDivider marks the beginning of a file section
-	SectionDivider = "----"
+	SectionDivider = "--------"
 
 	// EndMarker indicates the end of the repository content
-	EndMarker = "--END--"
+	EndMarker = "----END----"
 )
+
+// VCS directories to auto-exclude by default
+var vcsDirectories = []string{
+	".git/",
+	".svn/",
+	".hg/",
+	".bzr/",
+	"CVS/",
+	".darcs/",
+}
 
 // Global warning counter
 var warningCount int
@@ -31,40 +44,10 @@ var header = fmt.Sprintf(`This text describes a repository with code. It consist
 
 // Config holds the program configuration
 type Config struct {
-	Directory  string
-	Output     string
-	OutputPath string
-}
-
-// parseConfig parses command line arguments and returns a Config
-func parseConfig(args []string) (*Config, error) {
-	config := &Config{
-		Directory: ".",
-	}
-
-	switch len(args) {
-	case 0:
-		// unfolder (default to current directory)
-		config.Directory = "."
-	case 1:
-		// unfolder [directory]
-		config.Directory = args[0]
-	case 2:
-		// unfolder [directory] [output]
-		config.Directory = args[0]
-		config.Output = args[1]
-	default:
-		return nil, fmt.Errorf("too many arguments")
-	}
-
-	// Determine output file path
-	outputPath, err := determineOutputPath(config.Directory, config.Output)
-	if err != nil {
-		return nil, fmt.Errorf("determining output path: %w", err)
-	}
-	config.OutputPath = outputPath
-
-	return config, nil
+	Directory             string
+	Output                string
+	OutputPath            string
+	IncludeVCSDirectories bool
 }
 
 // exitWithError prints an error message and exits with code 1
@@ -80,34 +63,60 @@ func printWarning(format string, args ...interface{}) {
 }
 
 func main() {
-	args := os.Args[1:]
-
-	// Handle help flag
-	if 0 < len(args) && (args[0] == "--help" || args[0] == "-h") {
-		showHelp()
-		return
+	cmd := &cli.Command{
+		Name:    "unfolder",
+		Usage:   "Convert repository contents to text format for AI analysis",
+		Version: fmt.Sprintf("%s (%s) %s", version, commit, date),
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:    "include-vcs",
+				Usage:   "Include VCS directories (.git/, .svn/, etc.) in output",
+				Aliases: []string{"vcs"},
+			},
+		},
+		Action: run,
 	}
 
-	// Handle version flag
-	if 0 < len(args) && (args[0] == "--version" || args[0] == "-v") {
-		showVersion()
-		return
+	if err := cmd.Run(context.Background(), os.Args); err != nil {
+		exitWithError("%v", err)
+	}
+}
+
+// run is the main application logic
+func run(ctx context.Context, c *cli.Command) error {
+	args := c.Args().Slice()
+
+	// Parse positional arguments
+	var directory, output string
+	switch len(args) {
+	case 0:
+		directory = "."
+	case 1:
+		directory = args[0]
+	case 2:
+		directory = args[0]
+		output = args[1]
+	default:
+		return cli.Exit("Too many arguments", 1)
 	}
 
-	// Parse arguments
-	config, err := parseConfig(args)
+	// Create config
+	config := &Config{
+		Directory:             directory,
+		Output:                output,
+		IncludeVCSDirectories: c.Bool("include-vcs"),
+	}
+
+	// Determine output file path
+	outputPath, err := determineOutputPath(config.Directory, config.Output)
 	if err != nil {
-		if err.Error() == "too many arguments" {
-			exitWithError("Too many arguments")
-			showHelp()
-		} else {
-			exitWithError("Error parsing arguments: %v", err)
-		}
+		return cli.Exit(fmt.Sprintf("Error determining output path: %v", err), 1)
 	}
+	config.OutputPath = outputPath
 
 	// Process the repository
-	if err := processRepository(config.Directory, config.OutputPath); err != nil {
-		exitWithError("%v", err)
+	if err := processRepository(config.Directory, config.OutputPath, config); err != nil {
+		return cli.Exit(fmt.Sprintf("%v", err), 1)
 	}
 
 	// Write --END-- marker
@@ -121,31 +130,8 @@ func main() {
 	if warningCount > 0 {
 		fmt.Fprintf(os.Stderr, "\nNote: %d warning(s) occurred during processing. Some files may have been skipped due to permission issues.\n", warningCount)
 	}
-}
 
-func showVersion() {
-	fmt.Printf("unfolder version %s (%s) %s\n", version, commit, date)
-}
-
-func showHelp() {
-	fmt.Printf(`unfolder - Convert repository contents to text format for AI analysis
-
-Usage: unfolder [directory] [output]
-
-Arguments:
-    directory    Target directory to process (default: current directory)
-    output       Output file or directory (default: current directory)
-
-Examples:
-    unfolder                           # Process current dir → ./dirname.txt
-    unfolder /path/to/repo             # Process repo → ./repo.txt
-    unfolder /path/to/repo /tmp/       # Process repo → /tmp/repo.txt
-    unfolder /path/to/repo custom.txt  # Process repo → ./custom.txt
-
-Options:
-    --help, -h      Show this help message
-    --version, -v   Show version information
-`)
+	return nil
 }
 
 func determineOutputPath(directory, output string) (string, error) {
@@ -171,7 +157,7 @@ func determineOutputPath(directory, output string) (string, error) {
 	return output, nil
 }
 
-func processRepository(directory, outputPath string) error {
+func processRepository(directory, outputPath string, config *Config) error {
 	// Load ignore patterns
 	ignorePatterns, err := loadIgnorePatterns(directory)
 	if err != nil {
@@ -196,7 +182,7 @@ func processRepository(directory, outputPath string) error {
 	defer output.Close()
 
 	// Walk through files
-	return walkAndProcessFiles(absDir, absOutput, ignorePatterns, output)
+	return walkAndProcessFiles(absDir, absOutput, ignorePatterns, output, config)
 }
 
 // createOutputFile creates the output file and writes the header
@@ -212,7 +198,7 @@ func createOutputFile(outputPath string) (*os.File, error) {
 }
 
 // walkAndProcessFiles walks through the directory and processes each file
-func walkAndProcessFiles(absDir, absOutput string, ignorePatterns []string, output *os.File) error {
+func walkAndProcessFiles(absDir, absOutput string, ignorePatterns []string, output *os.File, config *Config) error {
 	return filepath.WalkDir(absDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// Handle permission errors for directories
@@ -232,19 +218,19 @@ func walkAndProcessFiles(absDir, absOutput string, ignorePatterns []string, outp
 
 		// Check if directory should be ignored (before entering it)
 		if d.IsDir() {
-			if shouldIgnore(relPath, ignorePatterns) {
+			if shouldIgnore(relPath, ignorePatterns, config) {
 				return filepath.SkipDir // Skip this directory and its contents
 			}
 			return nil // Continue into this directory
 		}
 
 		// For files, process normally
-		return processDirectoryEntry(path, d, absDir, absOutput, ignorePatterns, output)
+		return processDirectoryEntry(path, d, absDir, absOutput, ignorePatterns, output, config)
 	})
 }
 
 // processDirectoryEntry processes a single directory entry (file or subdirectory)
-func processDirectoryEntry(path string, d fs.DirEntry, absDir, absOutput string, ignorePatterns []string, output *os.File) error {
+func processDirectoryEntry(path string, d fs.DirEntry, absDir, absOutput string, ignorePatterns []string, output *os.File, config *Config) error {
 	// Skip if it's the output file itself
 	if absPath, _ := filepath.Abs(path); absPath == absOutput {
 		return nil
@@ -264,7 +250,7 @@ func processDirectoryEntry(path string, d fs.DirEntry, absDir, absOutput string,
 	}
 
 	// Check if file should be ignored
-	if shouldIgnore(relPath, ignorePatterns) {
+	if shouldIgnore(relPath, ignorePatterns, config) {
 		return nil
 	}
 
@@ -320,7 +306,17 @@ func readIgnoreFile(path string) ([]string, error) {
 	return patterns, scanner.Err()
 }
 
-func shouldIgnore(filePath string, patterns []string) bool {
+func shouldIgnore(filePath string, patterns []string, config *Config) bool {
+	// Check VCS directories first (unless explicitly included)
+	if !config.IncludeVCSDirectories {
+		for _, vcsDir := range vcsDirectories {
+			if strings.HasPrefix(filePath, vcsDir) || filePath == strings.TrimSuffix(vcsDir, "/") {
+				return true
+			}
+		}
+	}
+
+	// Check user-defined patterns
 	for _, pattern := range patterns {
 		if matchPattern(filePath, pattern) {
 			return true

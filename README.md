@@ -83,6 +83,7 @@ README.md
 - Ignores symbolic links and directories
 - Cross-platform support (Windows, macOS, Linux)
 - Supports complex gitignore patterns including wildcards and directory matching
+- Auto-exclude by default the VCS directories such as`.git/`, `.svn/`, `.hg/`, `.bzr/`, `CVS/`, and `.darcs/`
 
 ## File Filtering
 
