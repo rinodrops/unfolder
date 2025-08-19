@@ -2,19 +2,22 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/urfave/cli/v3"
 )
 
 const (
 	// SectionDivider marks the beginning of a file section
-	SectionDivider = "----"
+	SectionDivider = "--------"
 
 	// EndMarker indicates the end of the repository content
-	EndMarker = "--END--"
+	EndMarker = "----END----"
 )
 
 // VCS directories to auto-exclude by default
@@ -41,64 +44,10 @@ var header = fmt.Sprintf(`This text describes a repository with code. It consist
 
 // Config holds the program configuration
 type Config struct {
-	Directory            string
-	Output               string
-	OutputPath           string
+	Directory             string
+	Output                string
+	OutputPath            string
 	IncludeVCSDirectories bool
-}
-
-// parseConfig parses command line arguments and returns a Config
-func parseConfig(args []string) (*Config, error) {
-	config := &Config{
-		Directory:            ".",
-		IncludeVCSDirectories: false,
-	}
-
-	// Parse flags (can be anywhere in the argument list)
-	var positionalArgs []string
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch arg {
-		case "--include-vcs":
-			config.IncludeVCSDirectories = true
-		case "--include-vcs-directories":
-			config.IncludeVCSDirectories = true
-		case "--help", "-h":
-			// Help is handled in main(), just skip it here
-		case "--version", "-v":
-			// Version is handled in main(), just skip it here
-		default:
-			// Only add non-flag arguments to positional args
-			if !strings.HasPrefix(arg, "-") {
-				positionalArgs = append(positionalArgs, arg)
-			}
-		}
-	}
-
-	// Parse positional arguments
-	switch len(positionalArgs) {
-	case 0:
-		// unfolder (default to current directory)
-		config.Directory = "."
-	case 1:
-		// unfolder [directory]
-		config.Directory = positionalArgs[0]
-	case 2:
-		// unfolder [directory] [output]
-		config.Directory = positionalArgs[0]
-		config.Output = positionalArgs[1]
-	default:
-		return nil, fmt.Errorf("too many arguments")
-	}
-
-	// Determine output file path
-	outputPath, err := determineOutputPath(config.Directory, config.Output)
-	if err != nil {
-		return nil, fmt.Errorf("determining output path: %w", err)
-	}
-	config.OutputPath = outputPath
-
-	return config, nil
 }
 
 // exitWithError prints an error message and exits with code 1
@@ -114,34 +63,60 @@ func printWarning(format string, args ...interface{}) {
 }
 
 func main() {
-	args := os.Args[1:]
-
-	// Handle help flag
-	if 0 < len(args) && (args[0] == "--help" || args[0] == "-h") {
-		showHelp()
-		return
+	cmd := &cli.Command{
+		Name:    "unfolder",
+		Usage:   "Convert repository contents to text format for AI analysis",
+		Version: fmt.Sprintf("%s (%s) %s", version, commit, date),
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:    "include-vcs",
+				Usage:   "Include VCS directories (.git/, .svn/, etc.) in output",
+				Aliases: []string{"vcs"},
+			},
+		},
+		Action: run,
 	}
 
-	// Handle version flag
-	if 0 < len(args) && (args[0] == "--version" || args[0] == "-v") {
-		showVersion()
-		return
+	if err := cmd.Run(context.Background(), os.Args); err != nil {
+		exitWithError("%v", err)
+	}
+}
+
+// run is the main application logic
+func run(ctx context.Context, c *cli.Command) error {
+	args := c.Args().Slice()
+
+	// Parse positional arguments
+	var directory, output string
+	switch len(args) {
+	case 0:
+		directory = "."
+	case 1:
+		directory = args[0]
+	case 2:
+		directory = args[0]
+		output = args[1]
+	default:
+		return cli.Exit("Too many arguments", 1)
 	}
 
-	// Parse arguments
-	config, err := parseConfig(args)
+	// Create config
+	config := &Config{
+		Directory:             directory,
+		Output:                output,
+		IncludeVCSDirectories: c.Bool("include-vcs"),
+	}
+
+	// Determine output file path
+	outputPath, err := determineOutputPath(config.Directory, config.Output)
 	if err != nil {
-		if err.Error() == "too many arguments" {
-			exitWithError("Too many arguments")
-			showHelp()
-		} else {
-			exitWithError("Error parsing arguments: %v", err)
-		}
+		return cli.Exit(fmt.Sprintf("Error determining output path: %v", err), 1)
 	}
+	config.OutputPath = outputPath
 
 	// Process the repository
 	if err := processRepository(config.Directory, config.OutputPath, config); err != nil {
-		exitWithError("%v", err)
+		return cli.Exit(fmt.Sprintf("%v", err), 1)
 	}
 
 	// Write --END-- marker
@@ -155,32 +130,8 @@ func main() {
 	if warningCount > 0 {
 		fmt.Fprintf(os.Stderr, "\nNote: %d warning(s) occurred during processing. Some files may have been skipped due to permission issues.\n", warningCount)
 	}
-}
 
-func showVersion() {
-	fmt.Printf("unfolder version %s (%s) %s\n", version, commit, date)
-}
-
-func showHelp() {
-	fmt.Printf(`unfolder - Convert repository contents to text format for AI analysis
-
-Usage: unfolder [options] [directory] [output]
-
-Arguments:
-    directory    Target directory to process (default: current directory)
-    output       Output file or directory (default: current directory)
-
-Examples:
-    unfolder                           # Process current dir → ./dirname.txt
-    unfolder /path/to/repo             # Process repo → ./repo.txt
-    unfolder /path/to/repo /tmp/       # Process repo → /tmp/repo.txt
-    unfolder /path/to/repo custom.txt  # Process repo → ./custom.txt
-
-Options:
-    --help, -h              Show this help message
-    --version, -v           Show version information
-    --include-vcs           Include VCS directories (.git/, .svn/, etc.) in output
-`)
+	return nil
 }
 
 func determineOutputPath(directory, output string) (string, error) {
