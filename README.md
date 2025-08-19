@@ -56,23 +56,23 @@ unfolder /path/to/repo report.txt
 The generated file contains:
 
 1. Header explaining the format
-2. File sections starting with `----`
+2. File sections starting with `--------`
 3. File path on the next line
 4. File contents
-5. End marker `--END--`
+5. End marker `----END----`
 
 Example:
 ```
 This text describes a repository with code...
-----
+--------
 main.go
 package main
 ...
-----
+--------
 README.md
 # My Project
 ...
---END--
+----END----
 ```
 
 ## Features
