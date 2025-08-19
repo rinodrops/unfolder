@@ -42,6 +42,13 @@ var (
 
 var header = fmt.Sprintf(`This text describes a repository with code. It consists of sections starting with %s, followed by a line with the file path and name, then varying lines of file contents. The repository text concludes when %s is reached. Any text after %s is to be understood as instructions related to the provided repository.`, SectionDivider, EndMarker, EndMarker)
 
+// IgnorePattern represents a single ignore pattern with its directory context
+type IgnorePattern struct {
+	Pattern   string // The actual pattern (e.g., "*.log", "temp/")
+	Dir       string // The directory where this pattern was found (relative to root)
+	IsNegated bool   // Whether this pattern is negated (starts with !)
+}
+
 // Config holds the program configuration
 type Config struct {
 	Directory             string
@@ -198,7 +205,7 @@ func createOutputFile(outputPath string) (*os.File, error) {
 }
 
 // walkAndProcessFiles walks through the directory and processes each file
-func walkAndProcessFiles(absDir, absOutput string, ignorePatterns []string, output *os.File, config *Config) error {
+func walkAndProcessFiles(absDir, absOutput string, ignorePatterns []IgnorePattern, output *os.File, config *Config) error {
 	return filepath.WalkDir(absDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// Handle permission errors for directories
@@ -230,7 +237,7 @@ func walkAndProcessFiles(absDir, absOutput string, ignorePatterns []string, outp
 }
 
 // processDirectoryEntry processes a single directory entry (file or subdirectory)
-func processDirectoryEntry(path string, d fs.DirEntry, absDir, absOutput string, ignorePatterns []string, output *os.File, config *Config) error {
+func processDirectoryEntry(path string, d fs.DirEntry, absDir, absOutput string, ignorePatterns []IgnorePattern, output *os.File, config *Config) error {
 	// Skip if it's the output file itself
 	if absPath, _ := filepath.Abs(path); absPath == absOutput {
 		return nil
@@ -263,22 +270,74 @@ func processDirectoryEntry(path string, d fs.DirEntry, absDir, absOutput string,
 	return processFile(path, relPath, output)
 }
 
-func loadIgnorePatterns(directory string) ([]string, error) {
-	var patterns []string
+func loadIgnorePatterns(directory string) ([]IgnorePattern, error) {
+	var patterns []IgnorePattern
 
-	// Load .gitignore
-	gitignorePath := filepath.Join(directory, ".gitignore")
-	if gitPatterns, err := readIgnoreFile(gitignorePath); err == nil {
-		patterns = append(patterns, gitPatterns...)
+	// Get absolute path for the root directory
+	absDir, err := filepath.Abs(directory)
+	if err != nil {
+		return nil, err
 	}
 
-	// Load .unfolderignore
-	unfolderIgnorePath := filepath.Join(directory, ".unfolderignore")
-	if unfolderPatterns, err := readIgnoreFile(unfolderIgnorePath); err == nil {
-		patterns = append(patterns, unfolderPatterns...)
+	// Load ignore patterns incrementally, respecting already-loaded patterns
+	err = loadIgnorePatternsRecursive(absDir, "", &patterns)
+	return patterns, err
+}
+
+// loadIgnorePatternsRecursive loads ignore patterns recursively, respecting already-loaded patterns
+func loadIgnorePatternsRecursive(absDir, relDir string, patterns *[]IgnorePattern) error {
+	// Build current path
+	currentPath := absDir
+	if relDir != "" {
+		currentPath = filepath.Join(absDir, relDir)
 	}
 
-	return patterns, nil
+	// Check if current directory should be ignored based on already-loaded patterns
+	if relDir != "" && shouldIgnore(relDir, *patterns, &Config{IncludeVCSDirectories: false}) {
+		return nil // Skip this directory entirely
+	}
+
+	// Read .gitignore and .unfolderignore files in current directory
+	ignoreFiles := []string{".gitignore", ".unfolderignore"}
+	for _, ignoreFile := range ignoreFiles {
+		ignorePath := filepath.Join(currentPath, ignoreFile)
+		if filePatterns, err := readIgnoreFileWithContext(ignorePath, relDir); err == nil {
+			*patterns = append(*patterns, filePatterns...)
+		}
+	}
+
+	// List directory contents
+	entries, err := os.ReadDir(currentPath)
+	if err != nil {
+		if os.IsPermission(err) {
+			printWarning("Permission denied accessing %s: %v", currentPath, err)
+			return nil
+		}
+		return err
+	}
+
+	// Process subdirectories
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		// Skip VCS directories
+		if !shouldIgnore(entry.Name(), *patterns, &Config{IncludeVCSDirectories: false}) {
+			// Build relative path for subdirectory
+			subRelDir := entry.Name()
+			if relDir != "" {
+				subRelDir = filepath.Join(relDir, entry.Name())
+			}
+
+			// Recursively load patterns from subdirectory
+			if err := loadIgnorePatternsRecursive(absDir, subRelDir, patterns); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 func readIgnoreFile(path string) ([]string, error) {
@@ -306,23 +365,103 @@ func readIgnoreFile(path string) ([]string, error) {
 	return patterns, scanner.Err()
 }
 
-func shouldIgnore(filePath string, patterns []string, config *Config) bool {
+func readIgnoreFileWithContext(path, ignoreDir string) ([]IgnorePattern, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		// Check if it's a permission error
+		if os.IsPermission(err) {
+			printWarning("Permission denied reading %s: %v", path, err)
+			return nil, nil // Return empty patterns, continue processing
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	var patterns []IgnorePattern
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Skip empty lines and comments
+		if line != "" && !strings.HasPrefix(line, "#") {
+			isNegated := strings.HasPrefix(line, "!")
+			pattern := line
+			if isNegated {
+				pattern = strings.TrimPrefix(line, "!")
+			}
+
+			patterns = append(patterns, IgnorePattern{
+				Pattern:   pattern,
+				Dir:       ignoreDir,
+				IsNegated: isNegated,
+			})
+		}
+	}
+
+	return patterns, scanner.Err()
+}
+
+func shouldIgnore(filePath string, patterns []IgnorePattern, config *Config) bool {
 	// Check VCS directories first (unless explicitly included)
 	if !config.IncludeVCSDirectories {
 		for _, vcsDir := range vcsDirectories {
-			if strings.HasPrefix(filePath, vcsDir) || filePath == strings.TrimSuffix(vcsDir, "/") {
-				return true
+			// Check if the path contains a VCS directory anywhere in the path
+			// This handles cases like "baserow/.git/HEAD" or "project/.svn/entries"
+			pathParts := strings.Split(filepath.ToSlash(filePath), "/")
+			for _, part := range pathParts {
+				if part == strings.TrimSuffix(vcsDir, "/") {
+					return true
+				}
 			}
 		}
 	}
 
-	// Check user-defined patterns
+	// Check user-defined patterns with Git-like behavior
+	// Each .gitignore affects its own directory and sub-directories
 	for _, pattern := range patterns {
-		if matchPattern(filePath, pattern) {
-			return true
+		// Check if this pattern applies to the current file path
+		if isPatternApplicable(filePath, pattern) {
+			if pattern.IsNegated {
+				// Negated patterns override previous ignore decisions
+				return false
+			} else {
+				// Regular ignore pattern
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// isPatternApplicable checks if a pattern from a specific directory applies to the given file path
+func isPatternApplicable(filePath string, pattern IgnorePattern) bool {
+	// Convert paths to forward slashes for consistent matching
+	filePath = filepath.ToSlash(filePath)
+	patternDir := filepath.ToSlash(pattern.Dir)
+	patternText := filepath.ToSlash(pattern.Pattern)
+
+	// If the pattern is from the root directory (empty dir), it applies to all files
+	if patternDir == "" {
+		return matchPattern(filePath, patternText)
+	}
+
+	// Check if the file path is within the directory where this pattern was defined
+	// or in a subdirectory of that directory
+	if !strings.HasPrefix(filePath, patternDir+"/") && filePath != patternDir {
+		return false
+	}
+
+	// For patterns defined in a subdirectory, we need to check if the pattern
+	// matches the relative path from that directory
+	if patternDir != "" {
+		// Get the relative path from the pattern's directory
+		relPath := filePath
+		if strings.HasPrefix(filePath, patternDir+"/") {
+			relPath = filePath[len(patternDir+"/"):]
+		}
+		return matchPattern(relPath, patternText)
+	}
+
+	return matchPattern(filePath, patternText)
 }
 
 // Enhanced pattern matching for gitignore patterns
