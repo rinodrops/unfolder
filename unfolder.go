@@ -165,17 +165,25 @@ func determineOutputPath(directory, output string) (string, error) {
 }
 
 func processRepository(directory, outputPath string, config *Config) error {
-	// Load ignore patterns
-	ignorePatterns, err := loadIgnorePatterns(directory)
-	if err != nil {
-		return err
-	}
-
-	// Get absolute paths
+	// Get absolute path and resolve symlinks for the root directory FIRST
 	absDir, err := filepath.Abs(directory)
 	if err != nil {
 		return err
 	}
+
+	// FIXED: Resolve symlinks for the root directory
+	// This ensures that if the root directory is a symlink, we work with the actual directory
+	resolvedDir, err := filepath.EvalSymlinks(absDir)
+	if err != nil {
+		return fmt.Errorf("could not resolve directory path %s: %v", absDir, err)
+	}
+
+	// Load ignore patterns using the resolved directory
+	ignorePatterns, err := loadIgnorePatterns(resolvedDir)
+	if err != nil {
+		return err
+	}
+
 	absOutput, err := filepath.Abs(outputPath)
 	if err != nil {
 		return err
@@ -188,8 +196,8 @@ func processRepository(directory, outputPath string, config *Config) error {
 	}
 	defer output.Close()
 
-	// Walk through files
-	return walkAndProcessFiles(absDir, absOutput, ignorePatterns, output, config)
+	// Walk through files using the resolved directory
+	return walkAndProcessFiles(resolvedDir, absOutput, ignorePatterns, output, config)
 }
 
 // createOutputFile creates the output file and writes the header
@@ -225,7 +233,8 @@ func walkAndProcessFiles(absDir, absOutput string, ignorePatterns []IgnorePatter
 
 		// Check if directory should be ignored (before entering it)
 		if d.IsDir() {
-			if shouldIgnore(relPath, ignorePatterns, config) {
+			// Don't ignore the root directory itself, only subdirectories
+			if relPath != "." && shouldIgnore(relPath, ignorePatterns, config) {
 				return filepath.SkipDir // Skip this directory and its contents
 			}
 			return nil // Continue into this directory
@@ -243,9 +252,19 @@ func processDirectoryEntry(path string, d fs.DirEntry, absDir, absOutput string,
 		return nil
 	}
 
-	// Skip symlinks
+	// Skip symlinks (but only if they're directories to avoid infinite loops)
 	if d.Type()&fs.ModeSymlink != 0 {
-		return nil
+		// Check if the symlink points to a directory
+		info, err := os.Stat(path)
+		if err != nil {
+			// If we can't stat it, skip it
+			return nil
+		}
+		if info.IsDir() {
+			// Skip symlinked directories to avoid infinite loops
+			return nil
+		}
+		// Allow symlinked files (common in config management)
 	}
 
 	// Get relative path
@@ -273,14 +292,19 @@ func processDirectoryEntry(path string, d fs.DirEntry, absDir, absOutput string,
 func loadIgnorePatterns(directory string) ([]IgnorePattern, error) {
 	var patterns []IgnorePattern
 
-	// Get absolute path for the root directory
-	absDir, err := filepath.Abs(directory)
-	if err != nil {
-		return nil, err
+	// The directory should already be resolved by the caller
+	// But just to be safe, make it absolute if it isn't already
+	absDir := directory
+	if !filepath.IsAbs(directory) {
+		var err error
+		absDir, err = filepath.Abs(directory)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Load ignore patterns incrementally, respecting already-loaded patterns
-	err = loadIgnorePatternsRecursive(absDir, "", &patterns)
+	err := loadIgnorePatternsRecursive(absDir, "", &patterns)
 	return patterns, err
 }
 
